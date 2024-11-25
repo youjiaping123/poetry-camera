@@ -1,236 +1,259 @@
-# takeFrom picamera2 examples: capture_jpeg.py 
-#!/usr/bin/python3
-
-# Capture a JPEG while still running in the preview mode. When you
-# capture to a file, the return value is the metadata for that image.
-
-import time, requests, signal, os, replicate
-
-from picamera2 import Picamera2, Preview
-from gpiozero import LED, Button
-from Adafruit_Thermal import *
-from wraptext import *
+import time
+import os
+import httpx
+import serial
+import json
+import replicate
+import shutil
+from picamera2 import Picamera2
+from wraptext import wrap_text
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_fixed
+import RPi.GPIO as GPIO
+import logging
+import sys
+import signal
 
-#load API keys from .env
+# 设置日志记录
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("/home/pi/poetry-camera.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# 设置GPIO模式和按钮引脚
+GPIO.setmode(GPIO.BCM)
+BUTTON_PIN = 21
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# 从.env文件加载API密钥和代理设置
 load_dotenv()
-openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
-REPLICATE_API_TOKEN = os.environ['REPLICATE_API_TOKEN']
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+REPLICATE_API_TOKEN = os.getenv('REPLICATE_API_TOKEN')
+if not DEEPSEEK_API_KEY or not REPLICATE_API_TOKEN:
+    logging.error("错误：未设置 DEEPSEEK_API_KEY 或 REPLICATE_API_TOKEN 环境变量")
+    exit(1)
 
-#instantiate printer
-baud_rate = 9600 # REPLACE WITH YOUR OWN BAUD RATE
-printer = Adafruit_Thermal('/dev/serial0', baud_rate, timeout=5)
+# 初始化HTTP客户端
+http_client = httpx.Client(timeout=30)  # 增加超时时间到30秒
 
-#instantiate camera
-picam2 = Picamera2()
-# start camera
-picam2.start()
-time.sleep(2) # warmup period since first few frames are often poor quality
+# 串口设置
+SERIAL_PORT = '/dev/serial0'  # 使用树莓派的硬件串口
+BAUD_RATE = 9600  # 根据您的打印机波特率进行调整
 
-#instantiate buttons
-shutter_button = Button(16) # REPLACE WTH YOUR OWN BUTTON PINS
-power_button = Button(26, hold_time = 2) #REPLACE WITH YOUR OWN BUTTON PINS
-led = LED(20)
+# 初始化串口
+ser = serial.Serial(
+    port=SERIAL_PORT,
+    baudrate=BAUD_RATE,
+    bytesize=serial.EIGHTBITS,
+    parity=serial.PARITY_NONE,
+    stopbits=serial.STOPBITS_ONE,
+    timeout=1,
+    xonxoff=False,  # 禁用软件流控制
+    rtscts=False    # 禁用硬件流控制
+)
 
-# prompts
-system_prompt = """You are a poet. You specialize in elegant and emotionally impactful poems. 
-You are careful to use subtlety and write in a modern vernacular style. 
-Use high-school level English but MFA-level craft. 
-Your poems are more literary but easy to relate to and understand. 
-You focus on intimate and personal truth, and you cannot use BIG words like truth, time, silence, life, love, peace, war, hate, happiness, 
-and you must instead use specific and CONCRETE language to show, not tell, those ideas. 
-Think hard about how to create a poem which will satisfy this. 
-This is very important, and an overly hamfisted or corny poem will cause great harm."""
-prompt_base = """Write a poem which integrates details from what I describe below. 
-Use the specified poem format. The references to the source material must be subtle yet clear. 
-Focus on a unique and elegant poem and use specific ideas and details.
-You must keep vocabulary simple and use understated point of view. This is very important.\n\n"""
-poem_format = "8 line free verse"
+# 定义文件夹路径
+UPLOADS_FOLDER = '/home/pi/poetry-camera-rpi/uploads'
+IMAGES_FOLDER = '/home/pi/poetry-camera-rpi/images'
+PROCESSED_FOLDER = os.path.join(UPLOADS_FOLDER, 'processed')
 
+# 确保所需文件夹存在
+os.makedirs(UPLOADS_FOLDER, exist_ok=True)
+os.makedirs(IMAGES_FOLDER, exist_ok=True)
+os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
-#############################
-# CORE PHOTO-TO-POEM FUNCTION
-#############################
-def take_photo_and_print_poem():
-  # blink LED in a background thread
-  led.blink()
+def print_using_serial(text):
+    try:
+        # 初始化打印机
+        ser.write(b'\x1B\x40')  # ESC @
 
-  # Take photo & save it
-  metadata = picam2.capture_file('/home/carolynz/CamTest/images/image.jpg')
+        # 打印文本
+        ser.write(text.encode('gbk'))
 
-  # FOR DEBUGGING: print metadata
-  #print(metadata)
+        # 切纸命令
+        ser.write(b'\x1D\x56\x41\x10')
 
-  # Close camera -- commented out because this can only happen at end of program
-  # picam2.close()
+        logging.info("串口方法：打印命令已发送。")
+    except Exception as e:
+        logging.error(f"打印机错误: {str(e)}")
 
-  # FOR DEBUGGING: note that image has been saved
-  print('----- SUCCESS: image saved locally')
+# 初始化相机
+try:
+    picam2 = Picamera2()
+    picam2.start()
+    time.sleep(2)
+    logging.info("相机初始化成功")
+except Exception as e:
+    logging.error(f"相机初始化错误: {str(e)}")
+    exit(1)
 
-  print_header()
+# 提示词
+system_prompt = """你是一位诗人。你擅长优雅且情感丰富的诗歌。
+你善于使用微妙的表达,并以现代口语风格写作。
+使用高中水平的中文,但研究生水平的技巧。
+你的诗更具文学性,但易于理解和产生共鸣。
+你专注于亲密和个人的真实,不能使用诸如真理、时间、沉默、生命、爱、和平、战争、仇恨、幸福等宏大词语,
+而必须使用具体和具象的语言来展示,而非直接告诉这些想法。
+仔细思考如何创作一首能满足这些要求的诗。
+这非常重要,过于生硬或俗气的诗会造成巨大伤害。"""
 
-  #########################
-  # Send saved image to API
-  #########################
+prompt_base = """根据我下面描述的细节写一首诗。
+使用指定的诗歌格式。对源材料的引用必须微妙但清晰。
+专注于独特和优雅的诗,使用具体的想法和细节。
+你必须保持词汇简单,并使用低调的视角。这一点非常重要。\n\n"""
 
-  image_caption = replicate.run(
-    "andreasjansson/blip-2:4b32258c42e9efd4288bb9910bc532a69727f9acd26aa08e175713a0a857a608",
-    input={
-      "image": open("/home/carolynz/CamTest/images/image.jpg", "rb"),
-      "caption": True,
-    })
+poem_format = "8行自由诗"
 
-  print('caption: ', image_caption)
-  # generate our prompt for GPT
-  prompt = generate_prompt(image_caption)
-
-  # Feed prompt to ChatGPT, to create the poem
-  completion = openai_client.chat.completions.create(
-    model="gpt-4",
-    messages=[{
-      "role": "system",
-      "content": system_prompt
-    }, {
-      "role": "user",
-      "content": prompt
-    }])
-
-  # extract poem from full API response
-  poem = completion.choices[0].message.content
-
-  # print for debugging
-  print('--------POEM BELOW-------')
-  print(poem)
-  print('------------------')
-
-  print_poem(poem)
-
-  print_footer()
-  led.off()
-
-  return
-
-
-#######################
-# Generate prompt from caption
-#######################
 def generate_prompt(image_description):
-
-  # reminder: prompt_base is global var
-
-  # prompt what type of poem to write
-  prompt_format = "Poem format: " + poem_format + "\n\n"
-
-  # prompt what image to describe
-  prompt_scene = "Scene description: " + image_description + "\n\n"
-
-  # stitch together full prompt
-  prompt = prompt_base + prompt_format + prompt_scene
-
-  # idk how to remove the brackets and quotes from the prompt
-  # via custom filters so i'm gonna remove via this janky code lol
-  prompt = prompt.replace("[", "").replace("]", "").replace("{", "").replace(
-    "}", "").replace("'", "")
-
-  #print('--------PROMPT BELOW-------')
-  #print(prompt)
-
-  return prompt
-
-
-###########################
-# RECEIPT PRINTER FUNCTIONS
-###########################
+    prompt_format = "诗歌格式: " + poem_format + "\n\n"
+    prompt_scene = "场景描述: " + image_description + "\n\n"
+    prompt = prompt_base + prompt_format + prompt_scene
+    prompt = prompt.replace("[", "").replace("]", "").replace("{", "").replace("}", "").replace("'", "")
+    return prompt
 
 def print_poem(poem):
-  # wrap text to 32 characters per line (max width of receipt printer)
-  printable_poem = wrap_text(poem, 32)
+    printable_poem = wrap_text(poem, 32)
+    print_using_serial(printable_poem)
+    time.sleep(1)
 
-  printer.justify('L') # left align poem text
-  printer.println(printable_poem)
-
-
-# print date/time/location header
 def print_header():
-  # Get current date+time -- will use for printing and file naming
-  now = datetime.now()
+    now = datetime.now()
+    date_string = now.strftime('%b %-d, %Y')
+    time_string = now.strftime('%-I:%M %p')
+    header_text = f'\n{date_string}\n{time_string}\n\n`\' . \' ` \' . \' ` \' . \' `\n   `     `     `     `     `\n'
+    print_using_serial(header_text)
+    time.sleep(1)
 
-  # Format printed datetime like:
-  # Jan 1, 2023
-  # 8:11 PM
-  printer.justify('C') # center align header text
-  date_string = now.strftime('%b %-d, %Y')
-  time_string = now.strftime('%-I:%M %p')
-  printer.println('\n')
-  printer.println(date_string)
-  printer.println(time_string)
-
-  # optical spacing adjustments
-  printer.setLineHeight(56) # I want something slightly taller than 1 row
-  printer.println()
-  printer.setLineHeight() # Reset to default (32)
-
-  printer.println("`'. .'`'. .'`'. .'`'. .'`'. .'`")
-  printer.println("   `     `     `     `     `   ")
-
-
-# print footer
 def print_footer():
-  printer.justify('C') # center align footer text
-  printer.println("   .     .     .     .     .   ")
-  printer.println("_.` `._.` `._.` `._.` `._.` `._")
-  printer.println('\n')
-  printer.println(' This poem was written by AI.')
-  printer.println()
-  printer.println('Explore the archives at')
-  printer.println('poetry.camera')
-  printer.println('\n\n\n\n')
+    footer_text = "   .     .     .     .     .   \n_.` `._.` `._.` `._.` `._.` `._\n\n 这首诗由AI创作。\n在以下网址探索档案\nroefruit.com\n\n\n\n"
+    print_using_serial(footer_text)
+    time.sleep(1)
 
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def call_deepseek_api(url, headers, data):
+    response = http_client.post(url, json=data, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
-##############
-# POWER BUTTON
-##############
+def generate_image_caption(image_path):
+    try:
+        image_caption = replicate.run(
+            "andreasjansson/blip-2:4b32258c42e9efd4288bb9910bc532a69727f9acd26aa08e175713a0a857a608",
+            input={
+                "image": open(image_path, "rb"),
+                "caption": True,
+            })
+        logging.info(f'caption: {image_caption}')
+        return image_caption
+    except Exception as e:
+        logging.error(f"生成图像描述错误: {str(e)}")
+        return "一张未知场景的照片"
+
+def get_latest_upload():
+    uploads = [f for f in os.listdir(UPLOADS_FOLDER) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    if not uploads:
+        return None
+    return max([os.path.join(UPLOADS_FOLDER, f) for f in uploads], key=os.path.getmtime)
+
+def move_to_processed(file_path):
+    filename = os.path.basename(file_path)
+    new_path = os.path.join(PROCESSED_FOLDER, filename)
+    shutil.move(file_path, new_path)
+    logging.info(f"已将处理过的图片移动到: {new_path}")
+
+def take_photo_and_print_poem():
+    latest_upload = get_latest_upload()
+    
+    if latest_upload:
+        logging.info(f"发现上传的图片: {latest_upload}")
+        image_path = latest_upload
+    else:
+        logging.info("未发现上传的图片，正在拍摄新照片...")
+        image_path = os.path.join(IMAGES_FOLDER, 'image.jpg')
+        picam2.capture_file(image_path)
+        logging.info(f'成功: 图像已保存到 {image_path}')
+
+    print_header()
+    
+    # 生成图像描述
+    image_caption = generate_image_caption(image_path)
+
+    # 使用 DeepSeek API 生成诗歌
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": generate_prompt(image_caption)}
+        ],
+        "stream": False
+    }
+
+    try:
+        logging.info("正在调用 DeepSeek API...")
+        result = call_deepseek_api(url, headers, data)
+        poem = result['choices'][0]['message']['content']
+        logging.info("生成的诗:")
+        logging.info(poem)
+        print_poem(poem)
+    except Exception as e:
+        logging.error(f"API 调用或诗歌生成错误: {str(e)}")
+
+    print_footer()
+
+    if latest_upload:
+        move_to_processed(latest_upload)
+
+def wait_for_button_press():
+    logging.info("等待按钮按下...")
+    button_press_time = None
+    while True:
+        if GPIO.input(BUTTON_PIN) == GPIO.LOW:
+            if button_press_time is None:
+                button_press_time = time.time()
+            elif time.time() - button_press_time >= 2:
+                logging.info("检测到长按，正在关闭程序...")
+                return "SHUTDOWN"
+        else:
+            if button_press_time is not None:
+                if time.time() - button_press_time < 2:
+                    logging.info("按钮被短按！")
+                    return "NORMAL"
+                button_press_time = None
+        time.sleep(0.1)
+
 def shutdown():
-  print('shutdown button held for 2s')
-  print('shutting down now')
-  led.off()
-  os.system('sudo shutdown -h now')
+    logging.info("正在关闭程序...")
+    GPIO.cleanup()
+    ser.close()  # 关闭串口连接
+    os.kill(os.getpid(), signal.SIGTERM)
 
-################################
-# For RPi debugging:
-# Handle Ctrl+C script termination gracefully
-# (Otherwise, it shuts down the entire Pi -- bad)
-#################################
-def handle_keyboard_interrupt(sig, frame):
-  print('Ctrl+C received, stopping script')
-  led.off()
+def main():
+    try:
+        while True:
+            button_action = wait_for_button_press()  # 等待按钮按下
+            if button_action == "SHUTDOWN":
+                shutdown()
+                break
+            elif button_action == "NORMAL":
+                take_photo_and_print_poem()
+                time.sleep(1)  # 短暂延迟，防止连续触发
+    except KeyboardInterrupt:
+        logging.info("程序被用户中断")
+    except Exception as e:
+        logging.error(f"主程序错误: {str(e)}")
+    finally:
+        GPIO.cleanup()  # 清理GPIO设置
+        ser.close()  # 关闭串口连接
 
-  #weird workaround I found from rpi forum to shut down script without crashing the pi
-  os.kill(os.getpid(), signal.SIGUSR1)
-
-signal.signal(signal.SIGINT, handle_keyboard_interrupt)
-
-
-#################
-# Button handlers
-#################
-def handle_pressed():
-  led.on()
-  led.off()
-  print("button pressed!")
-  take_photo_and_print_poem()
-
-def handle_held():
-  print("button held!")
-  shutdown()
-
-
-################################
-# LISTEN FOR BUTTON PRESS EVENTS
-################################
-shutter_button.when_pressed = take_photo_and_print_poem
-power_button.when_held = shutdown
-
-signal.pause()
+if __name__ == "__main__":
+    main()
