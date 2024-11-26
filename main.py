@@ -69,36 +69,67 @@ os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
 def initialize_printer():
     try:
-        # 清空输入输出缓冲区
+        logging.info("开始初始化打印机...")
+        logging.info(f"串口状态 - 是否打开: {ser.is_open}")
+        
+        # 确保串口已关闭
+        if ser.is_open:
+            logging.info("关闭已打开的串口...")
+            ser.close()
+        
+        # 重新打开串口
+        logging.info("打开串口...")
+        ser.open()
+        logging.info(f"串口配置: 波特率={ser.baudrate}, 数据位={ser.bytesize}, 校验位={ser.parity}")
+        
+        # 清空缓冲区
+        logging.info("清空串口缓冲区...")
         ser.reset_input_buffer()
         ser.reset_output_buffer()
         
-        # 发送打印机初始化命令
-        ser.write(b'\x1B\x40')  # ESC @ 命令复位打印机
+        logging.info("等待打印机就绪...")
+        time.sleep(0.5)
+        
+        # 发送初始化命令
+        logging.info("发送打印机初始化命令...")
+        ser.write(b'\x1B\x40')
+        time.sleep(0.1)
+        logging.info("发送打印取消命令...")
+        ser.write(b'\x1B\x78')
         time.sleep(0.1)
         
-        # 发送取消命令以停止任何正在进行的打印
-        ser.write(b'\x1B\x78')  # 取消打印
-        time.sleep(0.1)
-        
-        logging.info("打印机已初始化")
+        logging.info("打印机初始化完成")
     except Exception as e:
-        logging.error(f"打印机初始化错误: {str(e)}")
+        logging.error(f"打印机初始化错误: {str(e)}", exc_info=True)
 
 def print_using_serial(text):
     try:
+        logging.info("准备打印文本...")
+        logging.info(f"串口状态检查 - 是否打开: {ser.is_open}")
+        
+        # 记录要打印的文本（前50个字符）
+        logging.info(f"打印文本预览: {text[:50]}...")
+        
         # 初始化打印机
-        ser.write(b'\x1B\x40')  # ESC @
-
-        # 打印文本
-        ser.write(text.encode('gbk'))
-
+        logging.info("发送打印机初始化命令...")
+        ser.write(b'\x1B\x40')
+        
+        # 记录发送的字节数
+        encoded_text = text.encode('gbk')
+        bytes_written = ser.write(encoded_text)
+        logging.info(f"已发送 {bytes_written} 字节数据")
+        
         # 切纸命令
+        logging.info("发送切纸命令...")
         ser.write(b'\x1D\x56\x41\x10')
-
-        logging.info("串口方法：打印命令已发送。")
+        
+        # 确保数据发送完成
+        logging.info("等待数据发送完成...")
+        ser.flush()
+        
+        logging.info("打印命令执行完成")
     except Exception as e:
-        logging.error(f"打印机错误: {str(e)}")
+        logging.error(f"打印机错误: {str(e)}", exc_info=True)
 
 # 初始化相机
 try:
@@ -185,51 +216,63 @@ def move_to_processed(file_path):
     logging.info(f"已将处理过的图片移动到: {new_path}")
 
 def take_photo_and_print_poem():
-    latest_upload = get_latest_upload()
-    
-    if latest_upload:
-        logging.info(f"发现上传的图片: {latest_upload}")
-        image_path = latest_upload
-    else:
-        logging.info("未发现上传的图片，正在拍摄新照片...")
-        image_path = os.path.join(IMAGES_FOLDER, 'image.jpg')
-        picam2.capture_file(image_path)
-        logging.info(f'成功: 图像已保存到 {image_path}')
-
-    print_header()
-    
-    # 生成图像描述
-    image_caption = generate_image_caption(image_path)
-
-    # 使用 DeepSeek API 生成诗歌
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": generate_prompt(image_caption)}
-        ],
-        "stream": False
-    }
-
     try:
-        logging.info("正在调用 DeepSeek API...")
-        result = call_deepseek_api(url, headers, data)
-        poem = result['choices'][0]['message']['content']
-        logging.info("生成的诗:")
-        logging.info(poem)
-        print_poem(poem)
+        # 打印前初始化
+        ser.write(b'\x1B\x40')
+        time.sleep(0.1)
+        
+        latest_upload = get_latest_upload()
+        
+        if latest_upload:
+            logging.info(f"发现上传的图片: {latest_upload}")
+            image_path = latest_upload
+        else:
+            logging.info("未发现上传的图片，正在拍摄新照片...")
+            image_path = os.path.join(IMAGES_FOLDER, 'image.jpg')
+            picam2.capture_file(image_path)
+            logging.info(f'成功: 图像已保存到 {image_path}')
+
+        print_header()
+        
+        # 生成图像描述
+        image_caption = generate_image_caption(image_path)
+
+        # 使用 DeepSeek API 生成诗歌
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": generate_prompt(image_caption)}
+            ],
+            "stream": False
+        }
+
+        try:
+            logging.info("正在调用 DeepSeek API...")
+            result = call_deepseek_api(url, headers, data)
+            poem = result['choices'][0]['message']['content']
+            logging.info("生成的诗:")
+            logging.info(poem)
+            print_poem(poem)
+        except Exception as e:
+            logging.error(f"API 调用或诗歌生成错误: {str(e)}")
+
+        print_footer()
+
+        if latest_upload:
+            move_to_processed(latest_upload)
+
+        # 打印后清理
+        ser.write(b'\x1B\x78')  # 取消打印
+        time.sleep(0.1)
+        ser.flush()
     except Exception as e:
-        logging.error(f"API 调用或诗歌生成错误: {str(e)}")
-
-    print_footer()
-
-    if latest_upload:
-        move_to_processed(latest_upload)
+        logging.error(f"打印过程错误: {str(e)}")
 
 def wait_for_button_press():
     logging.info("等待按钮按下...")
@@ -250,48 +293,100 @@ def wait_for_button_press():
         time.sleep(0.1)
 
 def shutdown():
-    logging.info("正在关闭程序...")
+    logging.info("开始执行关闭程序流程...")
     try:
-        # 清理打印机状态
-        ser.write(b'\x1B\x40')  # 发送打印机复位命令
-        time.sleep(0.1)
+        logging.info(f"当前串口状态 - 是否打开: {ser.is_open}")
+        
+        # 发送复位命令
+        logging.info("发送打印机复位命令...")
+        ser.write(b'\x1B\x40')
+        time.sleep(0.2)
+        
+        logging.info("发送打印取消命令...")
+        ser.write(b'\x1B\x78')
+        time.sleep(0.2)
+        
+        # 清理缓冲区
+        logging.info("清空串口缓冲区...")
         ser.reset_input_buffer()
         ser.reset_output_buffer()
-        ser.close()  # 关闭串口连接
+        
+        # 等待数据发送完成
+        logging.info("等待所有数据发送完成...")
+        ser.flush()
+        time.sleep(0.5)
+        
+        # 关闭串口
+        if ser.is_open:
+            logging.info("关闭串口连接...")
+            ser.close()
+            logging.info("串口已关闭")
+            
     except Exception as e:
-        logging.error(f"关闭打印机时出错: {str(e)}")
-    
-    GPIO.cleanup()
-    os.kill(os.getpid(), signal.SIGTERM)
+        logging.error(f"关闭打印机时出错: {str(e)}", exc_info=True)
+    finally:
+        logging.info("清理GPIO资源...")
+        GPIO.cleanup()
+        logging.info("发送终止信号...")
+        os.kill(os.getpid(), signal.SIGTERM)
+
+def signal_handler(signum, frame):
+    logging.info(f"收到系统信号: {signum}")
+    logging.info(f"当前进程状态: PID={os.getpid()}")
+    shutdown()
 
 def main():
+    logging.info("程序启动...")
+    logging.info(f"Python版本: {sys.version}")
+    logging.info(f"当前工作目录: {os.getcwd()}")
+    
+    # 注册信号处理器
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    logging.info("信号处理器已注册")
+    
     try:
-        # 程序启动时初始化打印机
         initialize_printer()
         
         while True:
+            logging.info("等待按钮输入...")
             button_action = wait_for_button_press()
+            
             if button_action == "SHUTDOWN":
+                logging.info("收到关机命令")
                 shutdown()
                 break
             elif button_action == "NORMAL":
+                logging.info("开始拍照打印流程")
                 take_photo_and_print_poem()
                 time.sleep(1)
+                logging.info("拍照打印流程完成")
+                
     except KeyboardInterrupt:
-        logging.info("程序被用户中断")
+        logging.info("程序被键盘中断")
     except Exception as e:
-        logging.error(f"主程序错误: {str(e)}")
+        logging.error(f"主程序发生错误: {str(e)}", exc_info=True)
     finally:
-        # 确保在程序结束时正确清理
+        logging.info("开始最终清理流程...")
         try:
-            ser.write(b'\x1B\x40')  # 发送打印机复位命令
+            logging.info("发送打印机复位命令...")
+            ser.write(b'\x1B\x40')
             time.sleep(0.1)
+            
+            logging.info("清空串口缓冲区...")
             ser.reset_input_buffer()
             ser.reset_output_buffer()
-            ser.close()
+            
+            if ser.is_open:
+                logging.info("关闭串口连接...")
+                ser.close()
+                
         except Exception as e:
-            logging.error(f"清理打印机时出错: {str(e)}")
+            logging.error(f"最终清理时出错: {str(e)}", exc_info=True)
+            
+        logging.info("清理GPIO资源...")
         GPIO.cleanup()
+        logging.info("程序正常结束")
 
 if __name__ == "__main__":
     main()
