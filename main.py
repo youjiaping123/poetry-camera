@@ -67,6 +67,24 @@ os.makedirs(UPLOADS_FOLDER, exist_ok=True)
 os.makedirs(IMAGES_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
+def initialize_printer():
+    try:
+        # 清空输入输出缓冲区
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        
+        # 发送打印机初始化命令
+        ser.write(b'\x1B\x40')  # ESC @ 命令复位打印机
+        time.sleep(0.1)
+        
+        # 发送取消命令以停止任何正在进行的打印
+        ser.write(b'\x1B\x78')  # 取消打印
+        time.sleep(0.1)
+        
+        logging.info("打印机已初始化")
+    except Exception as e:
+        logging.error(f"打印机初始化错误: {str(e)}")
+
 def print_using_serial(text):
     try:
         # 初始化打印机
@@ -233,27 +251,47 @@ def wait_for_button_press():
 
 def shutdown():
     logging.info("正在关闭程序...")
+    try:
+        # 清理打印机状态
+        ser.write(b'\x1B\x40')  # 发送打印机复位命令
+        time.sleep(0.1)
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        ser.close()  # 关闭串口连接
+    except Exception as e:
+        logging.error(f"关闭打印机时出错: {str(e)}")
+    
     GPIO.cleanup()
-    ser.close()  # 关闭串口连接
     os.kill(os.getpid(), signal.SIGTERM)
 
 def main():
     try:
+        # 程序启动时初始化打印机
+        initialize_printer()
+        
         while True:
-            button_action = wait_for_button_press()  # 等待按钮按下
+            button_action = wait_for_button_press()
             if button_action == "SHUTDOWN":
                 shutdown()
                 break
             elif button_action == "NORMAL":
                 take_photo_and_print_poem()
-                time.sleep(1)  # 短暂延迟，防止连续触发
+                time.sleep(1)
     except KeyboardInterrupt:
         logging.info("程序被用户中断")
     except Exception as e:
         logging.error(f"主程序错误: {str(e)}")
     finally:
-        GPIO.cleanup()  # 清理GPIO设置
-        ser.close()  # 关闭串口连接
+        # 确保在程序结束时正确清理
+        try:
+            ser.write(b'\x1B\x40')  # 发送打印机复位命令
+            time.sleep(0.1)
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            ser.close()
+        except Exception as e:
+            logging.error(f"清理打印机时出错: {str(e)}")
+        GPIO.cleanup()
 
 if __name__ == "__main__":
     main()
